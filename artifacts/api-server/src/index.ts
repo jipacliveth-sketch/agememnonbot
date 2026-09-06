@@ -76,6 +76,16 @@ async function main() {
     log("warn", "application_restarted_by_host", { pid: process.pid });
   }
 
+  // Create the bot and start the HTTP health server early so the process
+  // binds to 0.0.0.0:PORT quickly (required by Cloud Run). This does NOT
+  // bypass or weaken the later startup checks — readiness remains false
+  // until those checks complete successfully.
+  bot = createBot();
+  await startHealthServer(bot);
+
+  // Now perform the required dependency checks. If any of these fail,
+  // the application will still initiate shutdown as before and /api/readyz
+  // will continue returning not_ready until all readiness checks pass.
   await withRetry(verifyDatabaseReady, {
     operation: "database_startup_check",
     maxAttempts: 5,
@@ -108,8 +118,6 @@ async function main() {
   });
 
   registerConfiguredProviders();
-  bot = createBot();
-  await startHealthServer(bot);
 
   stopPlatformJobs = startPlatformJobs(db, {
     depositIntervalMs: env.DEPOSIT_WATCH_INTERVAL_MS,
