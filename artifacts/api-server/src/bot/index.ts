@@ -18,6 +18,7 @@ import {
 } from "./handlers/wallet.handler";
 import {
   tradeMenuHandler,
+  tradeStartHandler,
   strategyDetailHandler,
   strategyDetailsHandler,
   strategyStartHandler,
@@ -93,15 +94,14 @@ export function createBot(): Bot<BotContext> {
   });
 
   // Registered before specific callback routes so it wraps them (calls
-  // next() to run the matched handler, then acknowledges the callback
-  // query) rather than being skipped by an earlier handler's implicit stop.
+  // next() to run the matched handler after acknowledging the callback.
   bot.on("callback_query:data", async (ctx, next) => {
-    await next();
     try {
       await ctx.answerCallbackQuery();
     } catch {
-      /* already answered by a specific handler */
+      /* Telegram may have already acknowledged this callback. */
     }
+    await next();
   });
 
   // Intercepts plain text messages ONLY while the user is mid-deposit-flow
@@ -154,6 +154,7 @@ export function createBot(): Bot<BotContext> {
   bot.callbackQuery(/^trade:network:(SOLANA|BSC)$/, (ctx) => tradeNetworkHandler(ctx, ctx.match![1] as "SOLANA" | "BSC"));
   bot.callbackQuery(/^trade:token:(.+)$/, (ctx) => tradeTokenHandler(ctx, ctx.match![1]));
   bot.callbackQuery("trade:sniper", sniperEntryHandler);
+  bot.callbackQuery("trade:start", tradeStartHandler);
   bot.callbackQuery("trade:cancel", tradeCancelHandler);
   bot.callbackQuery("strategy:active", activeStrategiesHandler);
   bot.callbackQuery(/^history:page:(\d+)$/, (ctx) => transactionHistoryHandler(ctx, Number(ctx.match![1])));
@@ -175,8 +176,9 @@ async function tradeTextHandler(ctx: BotContext, next: NextFunction) {
     return;
   }
   const inTrade = ctx.session.flow?.name === "trade";
-  if (text === "trade" || (inTrade && (text === "back" || text === "cancel" || text === "solana" || text === "show tokens" || text === "sniper" || text === "find something hot" || text === "retry" || text === "stop"))) {
+  if (text === "trade" || text === "sniper" || text === "start bot" || (inTrade && (text === "back" || text === "cancel" || text === "solana" || text === "show tokens" || text === "find something hot" || text === "retry" || text === "stop"))) {
     if (text === "trade") return tradeMenuHandler(ctx);
+    if (text === "start bot") return tradeStartHandler(ctx);
     if (text === "cancel") return tradeCancelHandler(ctx);
     if (text === "stop") {
       const executionId = ctx.session.flow?.data.executionId;

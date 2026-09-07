@@ -1,7 +1,7 @@
 import { InlineKeyboard } from "grammy";
 import { and, eq, inArray } from "drizzle-orm";
 import { db } from "../../db/client";
-import { strategies, strategyExecutions, wallets } from "../../db/schema";
+import { strategies, strategyExecutions, wallets, simulationSessions } from "../../db/schema";
 import { BotContext } from "../context";
 import { withBack } from "../keyboards/navigation";
 import { renderMediaScreen, renderScreen } from "../lib/screen";
@@ -10,12 +10,20 @@ import { tradingEngineAdapter } from "../../trading-engine/adapter";
 import { getMarket } from "../../services/market-data.service";
 import { discoverSolanaTokens } from "../../services/token-discovery.service";
 import { scanSolanaMarkets } from "../../services/market-scanner.service";
+import { getWalletBalances } from "../../services/ledger.service";
+import { chooseMemeToken, SIMULATION_CONFIG, SNIPER_MEME_TOKENS, TRADE_MEME_TOKENS } from "../../config/simulation";
+import { calculatePositionSize, calculateTradeResult, capPositivePnl, completeSimulation, createSimulation, formatCooldown, getActiveSimulation, recordSimulationTrade, stopSimulation } from "../../services/simulation.service";
 
 const TRADE_STEPS = {
+  MENU: "MENU",
+  STARTING: "STARTING",
+  RUNNING: "RUNNING",
+  SCANNING_SNIPER: "SCANNING_SNIPER",
+  SNIPER_RUNNING: "SNIPER_RUNNING",
+  COMPLETE: "COMPLETE",
   SELECTING_NETWORK: "SELECTING_NETWORK",
   SELECTING_TOKEN: "SELECTING_TOKEN",
   VIEWING_TOKEN: "VIEWING_TOKEN",
-  SCANNING_SNIPER: "SCANNING_SNIPER",
   STARTING_BOT: "STARTING_BOT",
   ACTIVE: "ACTIVE",
   ERROR: "ERROR",
@@ -27,18 +35,25 @@ function setTradeFlow(ctx: BotContext, step: string, data: Record<string, string
 }
 
 function tradeKeyboard() {
-  return new InlineKeyboard()
-    .text("Solana", "trade:network:SOLANA")
-    .text("BEP20 BNB", "trade:network:BSC")
-    .row()
-    .text("Sniper Entry", "trade:sniper")
-    .row()
-    .text("Cancel", "trade:cancel");
+  return new InlineKeyboard().text("START BOT", "trade:start").row().text("SNIPER ENTRY", "trade:sniper").row().text("BACK", "menu:main");
 }
 
 export async function tradeMenuHandler(ctx: BotContext) {
-  setTradeFlow(ctx, TRADE_STEPS.SELECTING_NETWORK);
-  await renderMediaScreen(ctx, "🚀 TRADE", tradeKeyboard());
+  const active = await getActiveSimulation(db, ctx.session.userId!, "TRADE");
+  if (active) {
+    setTradeFlow(ctx, TRADE_STEPS.RUNNING, { sessionId: active.id });
+    await renderMediaScreen(ctx, formatSimulation(active), new InlineKeyboard().text("STOP BOT", "trade:cancel").row().text("BACK", "menu:main"));
+    return;
+  }
+  setTradeFlow(ctx, TRADE_STEPS.MENU);
+  await renderMediaScreen(ctx, "⚡ TRADE BOT", tradeKeyboard());
+}
+
+export async function tradeStartHandler(ctx: BotContext) {
+  if (ctx.session.flow?.step === TRADE_STEPS.STARTING || ctx.session.flow?.step === TRADE_STEPS.RUNNING) return;
+  setTradeFlow(ctx, TRADE_STEPS.STARTING);
+  await renderMediaScreen(ctx, "🤖 BOT STARTING...", new InlineKeyboard().text("STOP BOT", "trade:cancel"));
+  void runSimulation(ctx, "TRADE");
 }
 
 export async function tradeNetworkHandler(ctx: BotContext, network: "SOLANA" | "BSC") {
@@ -98,29 +113,56 @@ export async function tradeTokenHandler(ctx: BotContext, marketId: string) {
 }
 
 export async function sniperEntryHandler(ctx: BotContext) {
+  if (ctx.session.flow?.step === TRADE_STEPS.SCANNING_SNIPER || ctx.session.flow?.step === TRADE_STEPS.SNIPER_RUNNING) return;
   setTradeFlow(ctx, TRADE_STEPS.SCANNING_SNIPER);
-  await renderScreen(ctx, [
-    "🎯 SNIPER ENTRY",
-    "",
-    "Checking the configured market and strategy capabilities...",
-  ].join("\n"), withBack(new InlineKeyboard().text("Cancel", "trade:cancel"), "menu:trade"));
+  await renderMediaScreen(ctx, "🔎 ANALYZING MARKET", new InlineKeyboard().text("BACK", "menu:trade"));
+  void runSimulation(ctx, "SNIPER");
+}
 
+async function runSimulation(ctx: BotContext, type: "TRADE" | "SNIPER") {
   try {
-    const candidates = await scanSolanaMarkets("trending", 5);
-    const keyboard = new InlineKeyboard().text("Retry Scan", "trade:sniper").row();
-    for (const candidate of candidates) keyboard.text(`Select ${candidate.market.symbol}`, `trade:token:${candidate.market.id}`).row();
-    keyboard.text("Back", "menu:trade");
-    const text = candidates.length
-      ? ["⚡ SNIPER SETUPS DETECTED", "", ...candidates.map(formatCandidate), "", "Scores are calculated from live momentum, volume, liquidity proxy, and trend data."] .join("\n")
-      : "NO QUALIFYING SETUP\n\nNo live Solana market currently meets the configured momentum and activity filters.";
-    setTradeFlow(ctx, candidates.length ? TRADE_STEPS.VIEWING_TOKEN : TRADE_STEPS.ERROR, { reason: candidates.length ? "sniper_results" : "no_qualifying_setup" });
-    await renderScreen(ctx, text, keyboard);
-    return;
+    const universe = type === "TRADE" ? TRADE_MEME_TOKENS : SNIPER_MEME_TOKENS;
+    const token = chooseMemeToken(universe);
+    const market = await getMarket(token.marketId);
+    if (market.symbol !== token.symbol) throw new Error(`Configured ${token.symbol} market resolved as ${market.symbol}.`);
+    const wallet = await db.query.wallets.findFirst({ where: eq(wallets.userId, ctx.session.userId!) });
+    const balance = Number(wallet?.availableBalance ?? 0);
+    const positionSize = type === "SNIPER" ? calculatePositionSize(balance).amount : balance * 0.2;
+    const created = await createSimulation(db, ctx.session.userId!, type, { ...market, marketId: market.id }, type === "SNIPER" ? SIMULATION_CONFIG.sniperRuntimeMs : SIMULATION_CONFIG.tradeRuntimeMs, positionSize);
+    if (!created.created) return;
+    const session = created.session;
+    if (type === "SNIPER") await renderMediaScreen(ctx, `⚡ SNIPER TARGET FOUND\n\nToken: $${session.tokenSymbol}\nEntry: $${formatPrice(Number(session.entryPrice))}`, new InlineKeyboard().text("STOP BOT", "trade:cancel"));
+    else await renderMediaScreen(ctx, `🟢 BOT RUNNING\n\nTOKEN SELECTED\n${session.tokenSymbol}\n\nEntry: $${formatPrice(Number(session.entryPrice))}`, new InlineKeyboard().text("STOP BOT", "trade:cancel"));
+    setTradeFlow(ctx, type === "SNIPER" ? TRADE_STEPS.SNIPER_RUNNING : TRADE_STEPS.RUNNING, { sessionId: session.id });
+    await monitorSimulation(ctx, session.id, type);
   } catch (error) {
-    setTradeFlow(ctx, TRADE_STEPS.ERROR, { reason: "scanner_failed" });
-    const message = error instanceof Error ? error.message : "The configured market scanner failed.";
-    await renderScreen(ctx, ["🎯 SNIPER ENTRY", "", "Scan failed.", "", message, "", "No candidates or trades were created."].join("\n"), new InlineKeyboard().text("Retry Scan", "trade:sniper").row().text("Back", "menu:trade"));
-    return;
+    const cooldown = formatCooldown(error);
+    setTradeFlow(ctx, TRADE_STEPS.ERROR, {});
+    await renderMediaScreen(ctx, cooldown ? `SNIPER LIMIT REACHED\n\nTry again in ${cooldown}.` : `⚠️ SIMULATION UNAVAILABLE\n\n${error instanceof Error ? error.message : "The market provider is unavailable."}`, new InlineKeyboard().text("RETRY", type === "SNIPER" ? "trade:sniper" : "trade:start").row().text("BACK", "menu:trade"));
+  }
+}
+
+async function monitorSimulation(ctx: BotContext, sessionId: string, type: "TRADE" | "SNIPER") {
+  const deadline = Date.now() + (type === "SNIPER" ? SIMULATION_CONFIG.sniperRuntimeMs : SIMULATION_CONFIG.tradeRuntimeMs);
+  let completedTrades = 0;
+  while (Date.now() < deadline && completedTrades < (type === "SNIPER" ? 1 : 10)) {
+    await new Promise((resolve) => setTimeout(resolve, Math.min(SIMULATION_CONFIG.updateIntervalMs, Math.max(0, deadline - Date.now()))));
+    const session = await db.query.simulationSessions.findFirst({ where: eq(simulationSessions.id, sessionId) });
+    if (!session || session.status !== "RUNNING") return;
+    const market = await getMarket(session.marketId);
+    const current = market.priceUsd;
+    const movement = (current - Number(session.entryPrice)) / Number(session.entryPrice);
+    const outcome = movement >= 0.04 ? "TAKE_PROFIT" : movement <= -0.025 ? "STOP_LOSS" : "TIMEOUT";
+    const result = calculateTradeResult({ entryPrice: Number(session.entryPrice), exitPrice: current, positionSize: Number(session.positionSize), takeProfit: Number(session.takeProfit), stopLoss: Number(session.stopLoss), outcome, maxPositivePnl: Math.max(0, capPositivePnl(Number.POSITIVE_INFINITY, Number(session.startingBalance)) - Number(session.grossPnl)) });
+    await recordSimulationTrade(db, sessionId, result, current);
+    completedTrades += 1;
+    await renderMediaScreen(ctx, formatSimulation({ ...session, currentPrice: String(current), totalTrades: completedTrades, netPnl: String(result.netPnl) }), new InlineKeyboard().text("STOP BOT", "trade:cancel"));
+    if (type === "SNIPER") break;
+  }
+  const completed = await completeSimulation(db, sessionId);
+  if (completed) {
+    setTradeFlow(ctx, TRADE_STEPS.COMPLETE, { sessionId });
+    await renderMediaScreen(ctx, formatCompletion(completed), new InlineKeyboard().text("TRADE AGAIN", "trade:start").text("SNIPER ENTRY", "trade:sniper"));
   }
 }
 
@@ -197,8 +239,9 @@ export async function strategyStartHandler(ctx: BotContext, slug: string, market
 }
 
 export async function tradeCancelHandler(ctx: BotContext) {
+  await stopSimulation(db, ctx.session.userId!, ctx.session.flow?.data.sessionId);
   ctx.session.flow = { name: "trade", step: TRADE_STEPS.CANCELLED, data: {} };
-  await renderScreen(ctx, "Trade workflow cancelled. No order or strategy execution was created.", withBack(new InlineKeyboard(), "menu:main"));
+  await renderMediaScreen(ctx, "⏹ SIMULATION STOPPED\n\nNo real trade was executed.", new InlineKeyboard().text("TRADE", "menu:trade").text("BACK", "menu:main"));
 }
 
 export async function strategyStopHandler(ctx: BotContext, executionId: string) {
@@ -236,3 +279,27 @@ function formatCandidate(candidate: { market: { name: string; symbol: string; pr
 function formatPrice(value: number) { return value < 1 ? value.toPrecision(5) : value.toFixed(2); }
 function formatPercent(value: number | null) { return value === null ? "unavailable" : `${value >= 0 ? "+" : ""}${value.toFixed(2)}%`; }
 function formatUsd(value: number | null) { return value === null ? "unavailable" : `$${value.toLocaleString("en-US", { maximumFractionDigits: 0 })}`; }
+
+function formatSimulation(session: { tokenSymbol: string; entryPrice: string; currentPrice: string; positionSize: string; takeProfit: string; stopLoss: string; netPnl: string; totalTrades: number }) {
+  return [
+    "🎯 POSITION ACTIVE", "", session.tokenSymbol, "",
+    `Entry: $${formatPrice(Number(session.entryPrice))}`,
+    `Current: $${formatPrice(Number(session.currentPrice))}`,
+    `Position: $${formatPrice(Number(session.positionSize))}`, "",
+    `Take Profit: $${formatPrice(Number(session.takeProfit))}`,
+    `Stop Loss: $${formatPrice(Number(session.stopLoss))}`, "",
+    `P&L: ${Number(session.netPnl) >= 0 ? "+" : "-"}$${Math.abs(Number(session.netPnl)).toFixed(2)}`,
+    `Trades: ${session.totalTrades}`,
+  ].join("\n");
+}
+
+function formatCompletion(session: { tokenSymbol: string; startingBalance: string; endingBalance: string | null; netPnl: string; totalTrades: number; winningTrades: number; losingTrades: number; takeProfits: number; stopLosses: number }) {
+  return [
+    "✅ TRADE COMPLETE", "", `Token: ${session.tokenSymbol}`,
+    `Starting Balance: $${formatPrice(Number(session.startingBalance))}`,
+    `Ending Balance: $${formatPrice(Number(session.endingBalance ?? session.startingBalance))}`, "",
+    `Total P&L: ${Number(session.netPnl) >= 0 ? "+" : "-"}$${Math.abs(Number(session.netPnl)).toFixed(2)}`, "",
+    `Trades: ${session.totalTrades}`, `Won: ${session.winningTrades}`, `Lost: ${session.losingTrades}`, "",
+    `Take Profits: ${session.takeProfits}`, `Stop Losses: ${session.stopLosses}`,
+  ].join("\n");
+}

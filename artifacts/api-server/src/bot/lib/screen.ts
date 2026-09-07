@@ -39,7 +39,9 @@ export async function renderMediaScreen(
       await ctx.editMessageMedia({ type: "photo", media, caption: text }, { reply_markup: keyboard });
       return;
     } catch {
-      // Fall through when the current message is not media or Telegram cannot edit it.
+      if (ctx.chat && ctx.callbackQuery.message) {
+        await ctx.api.deleteMessage(ctx.chat.id, ctx.callbackQuery.message.message_id).catch(() => undefined);
+      }
     }
   }
   await ctx.replyWithPhoto(media, { caption: text, reply_markup: keyboard });
