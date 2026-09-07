@@ -1,25 +1,27 @@
-/**
- * Live market prices via CoinGecko's public API (no API key required for
- * this endpoint, subject to their public rate limits — ~10-30 req/min).
- * If this needs to scale beyond dev/small usage, move to a paid tier or
- * cache aggressively (see `CACHE_TTL_MS` below).
- *
- * Docs: https://www.coingecko.com/en/api/documentation
- */
-
 import { withRetry } from "../lib/retry";
 
 const COINGECKO_BASE_URL = "https://api.coingecko.com/api/v3";
+const CACHE_TTL_MS = 30_000;
+const COINGECKO_IDS: Record<string, string> = { SOL: "solana", USDT: "tether", BNB: "binancecoin", BTC: "bitcoin", ETH: "ethereum" };
 
-// CoinGecko's "id" for each asset we care about (not the same as the
-// ticker symbol) — extend this map as more assets/strategies are added.
-const COINGECKO_IDS: Record<string, string> = {
-  SOL: "solana",
-  USDT: "tether",
-  BNB: "binancecoin",
-  BTC: "bitcoin",
-  ETH: "ethereum",
-};
+export type MarketNetwork = "SOLANA" | "BSC" | "ETHEREUM" | "BASE" | "UNKNOWN";
+
+export interface MarketData {
+  id: string;
+  name: string;
+  symbol: string;
+  network: MarketNetwork;
+  contractAddress: string | null;
+  imageUrl: string | null;
+  priceUsd: number;
+  priceChange24h: number | null;
+  volume24hUsd: number | null;
+  marketCapUsd: number | null;
+  high24hUsd: number | null;
+  low24hUsd: number | null;
+  marketCapRank: number | null;
+  lastUpdatedAt: Date;
+}
 
 export interface PriceQuote {
   symbol: string;
@@ -28,109 +30,107 @@ export interface PriceQuote {
   fetchedAt: Date;
 }
 
-const CACHE_TTL_MS = 30_000; // 30s — plenty fresh for a dashboard, keeps well under rate limits
-const cache = new Map<string, { quote: PriceQuote; expiresAt: number }>();
+export interface MarketDataProvider {
+  discoverMarkets(options: { network: MarketNetwork; category?: string; limit?: number }): Promise<MarketData[]>;
+  getMarket(id: string): Promise<MarketData>;
+  getPrice(id: string): Promise<PriceQuote>;
+}
 
-/**
- * Fetches the current USD price for one symbol (e.g. "SOL"). Throws if
- * the symbol isn't mapped or the request fails — callers should catch
- * and show a clear "price unavailable" state rather than a fabricated
- * number (same principle as the rest of this codebase: never fake data).
- */
-export async function getUsdPrice(symbol: string): Promise<PriceQuote> {
-  const cached = cache.get(symbol);
-  if (cached && cached.expiresAt > Date.now()) {
-    return cached.quote;
-  }
-
-  const coingeckoId = COINGECKO_IDS[symbol.toUpperCase()];
-  if (!coingeckoId) {
-    throw new Error(`No CoinGecko id mapped for symbol "${symbol}" — add it to COINGECKO_IDS.`);
-  }
-
-  const url = `${COINGECKO_BASE_URL}/simple/price?ids=${coingeckoId}&vs_currencies=usd&include_24hr_change=true`;
-  const body = await withRetry(async () => {
-    const res = await fetch(url);
-    if (!res.ok) {
-      throw new Error(`CoinGecko price fetch failed for ${symbol}: HTTP ${res.status}`);
-    }
-    return (await res.json()) as Record<string, { usd: number; usd_24h_change?: number }>;
-  }, {
-    operation: `coingecko_price.${symbol.toUpperCase()}`,
-    maxAttempts: 3,
-    initialDelayMs: 300,
-    maxDelayMs: 3_000,
-  });
-  const entry = body[coingeckoId];
-  if (!entry || typeof entry.usd !== "number") {
-    throw new Error(`CoinGecko returned no price data for ${symbol}`);
-  }
-
-  const quote: PriceQuote = {
-    symbol: symbol.toUpperCase(),
-    usdPrice: entry.usd,
-    usd24hChange: typeof entry.usd_24h_change === "number" ? entry.usd_24h_change : null,
-    fetchedAt: new Date(),
+interface CoinGeckoMarketRow {
+  id?: string; name?: string; symbol?: string; current_price?: number;
+  price_change_percentage_24h?: number | null; total_volume?: number | null;
+  market_cap?: number | null; high_24h?: number | null; low_24h?: number | null;
+  market_cap_rank?: number | null; image?: string | { small?: string } | null; last_updated?: string;
+  platforms?: Record<string, string>;
+  market_data?: {
+    current_price?: Record<string, number>;
+    price_change_percentage_24h?: number | null;
+    total_volume?: Record<string, number | null>;
+    market_cap?: Record<string, number | null>;
+    high_24h?: Record<string, number | null>;
+    low_24h?: Record<string, number | null>;
   };
-
-  cache.set(symbol, { quote, expiresAt: Date.now() + CACHE_TTL_MS });
-  return quote;
 }
 
-/**
- * Fetches multiple symbols in a single CoinGecko request (cheaper on
- * rate limits than calling getUsdPrice in a loop). Returns a map keyed
- * by uppercased symbol; a symbol that fails to resolve is simply
- * omitted from the result rather than throwing for the whole batch —
- * callers should handle a missing key as "price unavailable" for that
- * one asset.
- */
+class CoinGeckoMarketDataProvider implements MarketDataProvider {
+  private readonly marketCache = new Map<string, { value: MarketData; expiresAt: number }>();
+  private readonly discoveryCache = new Map<string, { value: MarketData[]; expiresAt: number }>();
+
+  async discoverMarkets(options: { network: MarketNetwork; category?: string; limit?: number }): Promise<MarketData[]> {
+    if (options.network !== "SOLANA") return [];
+    const category = options.category ?? "solana-ecosystem";
+    const limit = Math.min(Math.max(options.limit ?? 50, 1), 100);
+    const cacheKey = `${category}:${limit}`;
+    const cached = this.discoveryCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) return cached.value.map(copyMarket);
+    const params = new URLSearchParams({ vs_currency: "usd", category, order: "volume_desc", per_page: String(limit), page: "1", sparkline: "false" });
+    const rows = await this.request<CoinGeckoMarketRow[]>(`/coins/markets?${params}`);
+    const markets = rows.map((row) => normalizeMarket(row, "SOLANA")).filter(Boolean) as MarketData[];
+    this.discoveryCache.set(cacheKey, { value: markets, expiresAt: Date.now() + CACHE_TTL_MS });
+    for (const market of markets) this.marketCache.set(market.id, { value: market, expiresAt: Date.now() + CACHE_TTL_MS });
+    return markets.map(copyMarket);
+  }
+
+  async getMarket(id: string): Promise<MarketData> {
+    const cached = this.marketCache.get(id);
+    if (cached && cached.expiresAt > Date.now()) return copyMarket(cached.value);
+    const row = await this.request<CoinGeckoMarketRow>(`/coins/${encodeURIComponent(id)}?localization=false&tickers=false&market_data=true&community_data=false&developer_data=false&sparkline=false`);
+    const market = normalizeMarket(row, inferNetwork(row));
+    if (!market) throw new Error(`CoinGecko returned incomplete market data for ${id}.`);
+    this.marketCache.set(id, { value: market, expiresAt: Date.now() + CACHE_TTL_MS });
+    return copyMarket(market);
+  }
+
+  async getPrice(id: string): Promise<PriceQuote> {
+    const market = await this.getMarket(id);
+    return { symbol: market.symbol, usdPrice: market.priceUsd, usd24hChange: market.priceChange24h, fetchedAt: market.lastUpdatedAt };
+  }
+
+  private async request<T>(path: string): Promise<T> {
+    return withRetry(async () => {
+      const response = await fetch(`${COINGECKO_BASE_URL}${path}`, { headers: { accept: "application/json" } });
+      if (!response.ok) throw new Error(`CoinGecko request failed: HTTP ${response.status}`);
+      return (await response.json()) as T;
+    }, { operation: "coingecko_market_data", maxAttempts: 3, initialDelayMs: 300, maxDelayMs: 3_000 });
+  }
+}
+
+export const marketDataProvider: MarketDataProvider = new CoinGeckoMarketDataProvider();
+export async function discoverMarkets(options: { network: MarketNetwork; category?: string; limit?: number }) { return marketDataProvider.discoverMarkets(options); }
+export async function getMarket(id: string) { return marketDataProvider.getMarket(id); }
+export async function getUsdPrice(symbol: string): Promise<PriceQuote> {
+  const id = COINGECKO_IDS[symbol.toUpperCase()];
+  if (!id) throw new Error(`No CoinGecko id mapped for symbol "${symbol}".`);
+  return marketDataProvider.getPrice(id);
+}
 export async function getUsdPrices(symbols: string[]): Promise<Map<string, PriceQuote>> {
-  const result = new Map<string, PriceQuote>();
-  const toFetch: { symbol: string; id: string }[] = [];
-
-  for (const symbol of symbols) {
-    const upper = symbol.toUpperCase();
-    const cached = cache.get(upper);
-    if (cached && cached.expiresAt > Date.now()) {
-      result.set(upper, cached.quote);
-      continue;
-    }
-    const id = COINGECKO_IDS[upper];
-    if (id) toFetch.push({ symbol: upper, id });
-  }
-
-  if (toFetch.length === 0) return result;
-
-  const ids = toFetch.map((t) => t.id).join(",");
-  const url = `${COINGECKO_BASE_URL}/simple/price?ids=${ids}&vs_currencies=usd&include_24hr_change=true`;
-
-  const body = await withRetry(async () => {
-    const res = await fetch(url);
-    if (!res.ok) {
-      throw new Error(`CoinGecko batch price fetch failed: HTTP ${res.status}`);
-    }
-    return (await res.json()) as Record<string, { usd: number; usd_24h_change?: number }>;
-  }, {
-    operation: "coingecko_price_batch",
-    maxAttempts: 3,
-    initialDelayMs: 300,
-    maxDelayMs: 3_000,
-  });
-
-  for (const { symbol, id } of toFetch) {
-    const entry = body[id];
-    if (!entry || typeof entry.usd !== "number") continue;
-
-    const quote: PriceQuote = {
-      symbol,
-      usdPrice: entry.usd,
-      usd24hChange: typeof entry.usd_24h_change === "number" ? entry.usd_24h_change : null,
-      fetchedAt: new Date(),
-    };
-    cache.set(symbol, { quote, expiresAt: Date.now() + CACHE_TTL_MS });
-    result.set(symbol, quote);
-  }
-
-  return result;
+  const entries = await Promise.all(symbols.map(async (symbol) => {
+    try { return [symbol.toUpperCase(), await getUsdPrice(symbol)] as const; } catch { return null; }
+  }));
+  return new Map(entries.filter((entry): entry is readonly [string, PriceQuote] => entry !== null));
 }
+
+function normalizeMarket(row: CoinGeckoMarketRow, network: MarketNetwork): MarketData | null {
+  const currentPrice = row.current_price ?? row.market_data?.current_price?.usd;
+  const priceChange = row.price_change_percentage_24h ?? row.market_data?.price_change_percentage_24h;
+  const volume = row.total_volume ?? row.market_data?.total_volume?.usd;
+  const marketCap = row.market_cap ?? row.market_data?.market_cap?.usd;
+  const high = row.high_24h ?? row.market_data?.high_24h?.usd;
+  const low = row.low_24h ?? row.market_data?.low_24h?.usd;
+  if (!row.id || !row.name || !row.symbol || typeof currentPrice !== "number" || currentPrice <= 0) return null;
+  return {
+    id: row.id, name: row.name, symbol: row.symbol.toUpperCase(), network,
+    contractAddress: row.platforms?.solana ?? null, imageUrl: typeof row.image === "string" ? row.image : row.image?.small ?? null, priceUsd: currentPrice,
+    priceChange24h: numberOrNull(priceChange), volume24hUsd: numberOrNull(volume),
+    marketCapUsd: numberOrNull(marketCap), high24hUsd: numberOrNull(high), low24hUsd: numberOrNull(low),
+    marketCapRank: numberOrNull(row.market_cap_rank), lastUpdatedAt: row.last_updated ? new Date(row.last_updated) : new Date(),
+  };
+}
+function inferNetwork(row: CoinGeckoMarketRow): MarketNetwork {
+  if (row.platforms?.solana) return "SOLANA";
+  if (row.platforms?.["binance-smart-chain"]) return "BSC";
+  if (row.platforms?.ethereum) return "ETHEREUM";
+  return "UNKNOWN";
+}
+function numberOrNull(value: number | null | undefined) { return typeof value === "number" && Number.isFinite(value) ? value : null; }
+function copyMarket(market: MarketData): MarketData { return { ...market, lastUpdatedAt: new Date(market.lastUpdatedAt) }; }

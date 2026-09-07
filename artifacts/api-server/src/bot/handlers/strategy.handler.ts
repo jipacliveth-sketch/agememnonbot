@@ -7,7 +7,9 @@ import { withBack } from "../keyboards/navigation";
 import { renderMediaScreen, renderScreen } from "../lib/screen";
 import { startPlatformStrategy, stopPlatformStrategy } from "../../services/trading.service";
 import { tradingEngineAdapter } from "../../trading-engine/adapter";
-import { getUsdPrice } from "../../services/market-data.service";
+import { getMarket } from "../../services/market-data.service";
+import { discoverSolanaTokens } from "../../services/token-discovery.service";
+import { scanSolanaMarkets } from "../../services/market-scanner.service";
 
 const TRADE_STEPS = {
   SELECTING_NETWORK: "SELECTING_NETWORK",
@@ -45,41 +47,60 @@ export async function tradeMenuHandler(ctx: BotContext) {
 
 export async function tradeNetworkHandler(ctx: BotContext, network: "SOLANA" | "BSC") {
   setTradeFlow(ctx, TRADE_STEPS.SELECTING_TOKEN, { network });
-  const available = await db.query.strategies.findMany({
-    where: and(eq(strategies.status, "AVAILABLE"), eq(strategies.enabled, true), eq(strategies.network, network)),
-  });
   const keyboard = new InlineKeyboard();
-  if (network === "SOLANA" && available.length) keyboard.text("SOL · Live market", "trade:token:SOL").row();
-  const text = network === "BSC"
-    ? "BEP20 BNB\n\nNo executable BSC token strategy is configured in the trading engine yet."
-    : available.length
-      ? "SOLANA\n\nThe current engine exposes SOL as its verified executable market. Select it to inspect live data."
-      : "SOLANA\n\nNo executable strategy is currently configured for this network.";
-  await renderScreen(ctx, text, withBack(keyboard, "menu:trade"));
+  if (network === "BSC") {
+    await renderScreen(ctx, "BEP20 BNB\n\nNo executable BSC token strategy is configured in the trading engine yet.", withBack(keyboard, "menu:trade"));
+    return;
+  }
+  try {
+    const tokens = await discoverSolanaTokens("all", 10);
+    for (const token of tokens) keyboard.text(`${token.name} (${token.symbol})`, `trade:token:${token.id}`).row();
+    const text = tokens.length
+      ? ["SOLANA · LIVE TOKEN DISCOVERY", "", ...tokens.map(formatTokenLine), "", "Select a real market to view details."] .join("\n")
+      : "SOLANA\n\nNo live Solana markets qualified for display right now.";
+    await renderScreen(ctx, text, withBack(keyboard, "menu:trade"));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "The Solana market provider is unavailable.";
+    await renderScreen(ctx, ["SOLANA MARKET DISCOVERY FAILED", "", message, "", "No token data was fabricated."].join("\n"), new InlineKeyboard().text("Retry", "trade:network:SOLANA").row().text("Back", "menu:trade"));
+  }
 }
 
-export async function tradeTokenHandler(ctx: BotContext, token: "SOL") {
-  setTradeFlow(ctx, TRADE_STEPS.VIEWING_TOKEN, { network: "SOLANA", token });
-  const [strategiesForToken, quote] = await Promise.all([
-    db.query.strategies.findMany({
-      where: and(eq(strategies.status, "AVAILABLE"), eq(strategies.enabled, true), eq(strategies.network, "SOLANA")),
-    }),
-    getUsdPrice(token).catch(() => null),
-  ]);
+export async function tradeTokenHandler(ctx: BotContext, marketId: string) {
+  setTradeFlow(ctx, TRADE_STEPS.VIEWING_TOKEN, { network: "SOLANA", marketId });
+  let strategiesForToken;
+  let market;
+  try {
+    [strategiesForToken, market] = await Promise.all([
+      db.query.strategies.findMany({
+        where: and(eq(strategies.status, "AVAILABLE"), eq(strategies.enabled, true), eq(strategies.network, "SOLANA")),
+      }),
+      getMarket(marketId),
+    ]);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "The market provider is unavailable.";
+    await renderScreen(ctx, ["TOKEN DATA UNAVAILABLE", "", message, "", "No price or token details were fabricated."].join("\n"), new InlineKeyboard().text("Retry", `trade:token:${marketId}`).row().text("Back", "trade:network:SOLANA"));
+    return;
+  }
   const keyboard = new InlineKeyboard();
-  for (const strategy of strategiesForToken) keyboard.text(`Start ${strategy.name}`, `strategy:start:${strategy.slug}`).row();
-  const priceLine = quote
-    ? `Live ${quote.symbol} price: $${quote.usdPrice.toFixed(2)}${quote.usd24hChange === null ? "" : ` (${quote.usd24hChange >= 0 ? "+" : ""}${quote.usd24hChange.toFixed(2)}% 24h)`}`
-    : "Live SOL price is currently unavailable.";
+  for (const strategy of strategiesForToken) {
+    keyboard.text(`5m · ${strategy.name}`, `strategy:start:${strategy.slug}:${market.id}:5`).row();
+    keyboard.text(`10m · ${strategy.name}`, `strategy:start:${strategy.slug}:${market.id}:10`).row();
+    keyboard.text(`15m · ${strategy.name}`, `strategy:start:${strategy.slug}:${market.id}:15`).row();
+  }
   await renderMediaScreen(ctx, [
-    "SOL · SOLANA",
+    `${market.name} · ${market.symbol}`,
     "",
-    priceLine,
+    `Network: ${market.network}`,
+    `Price: $${formatPrice(market.priceUsd)}`,
+    `24h: ${formatPercent(market.priceChange24h)}`,
+    `Volume: ${formatUsd(market.volume24hUsd)}`,
+    `Market cap: ${formatUsd(market.marketCapUsd)}`,
+    `Contract: ${market.contractAddress ?? "unavailable"}`,
     "",
-    "The engine opens a paper position from the verified live quote, then monitors it for configured exits.",
+    "Paper execution uses the current real provider price and continuously monitors the same market.",
     "",
     strategiesForToken.length ? "Select an executable strategy:" : "No executable strategy is available.",
-  ].join("\n"), withBack(keyboard, "trade:network:SOLANA"), "token-sol.png");
+  ].join("\n"), withBack(keyboard, "trade:network:SOLANA"), market.imageUrl ?? "token-sol.png");
 }
 
 export async function sniperEntryHandler(ctx: BotContext) {
@@ -90,33 +111,23 @@ export async function sniperEntryHandler(ctx: BotContext) {
     "Checking the configured market and strategy capabilities...",
   ].join("\n"), withBack(new InlineKeyboard().text("Cancel", "trade:cancel"), "menu:trade"));
 
-  let strategies;
   try {
-    strategies = await tradingEngineAdapter.getAvailableStrategies();
+    const candidates = await scanSolanaMarkets("trending", 5);
+    const keyboard = new InlineKeyboard().text("Retry Scan", "trade:sniper").row();
+    for (const candidate of candidates) keyboard.text(`Select ${candidate.market.symbol}`, `trade:token:${candidate.market.id}`).row();
+    keyboard.text("Back", "menu:trade");
+    const text = candidates.length
+      ? ["⚡ SNIPER SETUPS DETECTED", "", ...candidates.map(formatCandidate), "", "Scores are calculated from live momentum, volume, liquidity proxy, and trend data."] .join("\n")
+      : "NO QUALIFYING SETUP\n\nNo live Solana market currently meets the configured momentum and activity filters.";
+    setTradeFlow(ctx, candidates.length ? TRADE_STEPS.VIEWING_TOKEN : TRADE_STEPS.ERROR, { reason: candidates.length ? "sniper_results" : "no_qualifying_setup" });
+    await renderScreen(ctx, text, keyboard);
+    return;
   } catch (error) {
     setTradeFlow(ctx, TRADE_STEPS.ERROR, { reason: "scanner_failed" });
     const message = error instanceof Error ? error.message : "The configured market scanner failed.";
     await renderScreen(ctx, ["🎯 SNIPER ENTRY", "", "Scan failed.", "", message, "", "No candidates or trades were created."].join("\n"), new InlineKeyboard().text("Retry Scan", "trade:sniper").row().text("Back", "menu:trade"));
     return;
   }
-  const keyboard = new InlineKeyboard().text("Retry Scan", "trade:sniper").row().text("Back", "menu:trade");
-  const text = strategies.length
-    ? [
-      "🎯 SNIPER ENTRY",
-      "",
-      "No candidate ranking was produced.",
-      "",
-      "The connected engine exposes strategy metadata and live SOL execution, but no market-wide token scanner or volume/liquidity feed. No token is being recommended.",
-    ].join("\n")
-    : [
-      "🎯 SNIPER ENTRY",
-      "",
-      "Scan unavailable.",
-      "",
-      "The trading engine does not currently expose a market scanner. No candidates, scores, prices, or trades were fabricated.",
-    ].join("\n");
-  setTradeFlow(ctx, TRADE_STEPS.ERROR, { reason: "scanner_unavailable" });
-  await renderScreen(ctx, text, keyboard);
 }
 
 export async function strategyDetailHandler(ctx: BotContext, slug: string) {
@@ -165,24 +176,29 @@ export async function strategyDetailsHandler(ctx: BotContext, slug: string) {
   ].join("\n"), withBack(new InlineKeyboard().text("View Strategy", `strategy:view:${strategy.slug}`), "menu:trade"));
 }
 
-export async function strategyStartHandler(ctx: BotContext, slug: string) {
+export async function strategyStartHandler(ctx: BotContext, slug: string, marketId?: string, runtimeMinutes?: 5 | 10 | 15) {
   if (ctx.session.flow?.name === "trade" && ctx.session.flow.step === TRADE_STEPS.STARTING_BOT) {
-    await renderScreen(ctx, "This start request is already being processed.", withBack(new InlineKeyboard(), "trade:token:SOL"));
+    const activeMarketId = ctx.session.flow.data.marketId;
+    await renderScreen(ctx, "This start request is already being processed.", withBack(new InlineKeyboard(), activeMarketId ? `trade:token:${activeMarketId}` : "menu:trade"));
     return;
   }
-  setTradeFlow(ctx, TRADE_STEPS.STARTING_BOT, { strategySlug: slug });
+  const selectedMarketId = marketId ?? ctx.session.flow?.data.marketId;
+  setTradeFlow(ctx, TRADE_STEPS.STARTING_BOT, { strategySlug: slug, ...(selectedMarketId ? { marketId: selectedMarketId } : {}) });
   try {
-    const execution = await startPlatformStrategy(db, ctx.session.userId!, slug);
-    setTradeFlow(ctx, execution?.status === "ACTIVE" ? TRADE_STEPS.ACTIVE : TRADE_STEPS.STARTING_BOT, { strategySlug: slug });
+    const market = selectedMarketId ? await getMarket(selectedMarketId) : null;
+    const execution = await startPlatformStrategy(db, ctx.session.userId!, slug, { marketId: selectedMarketId, tokenSymbol: market?.symbol, runtimeMinutes });
+    setTradeFlow(ctx, execution?.status === "ACTIVE" ? TRADE_STEPS.ACTIVE : TRADE_STEPS.STARTING_BOT, { strategySlug: slug, executionId: execution?.id ?? "", ...(selectedMarketId ? { marketId: selectedMarketId } : {}) });
     await renderScreen(ctx, [
       "✅ PAPER BOT ACTIVATED", "",
       `Status: ${execution?.status ?? "STARTING"}`,
-      "The trading engine opened and owns this paper execution using live market data. Positions, exits, and P&L come from the engine.",
+      `The trading engine opened a simulated ${market?.symbol ?? "SOL"} position using the live market price. TP/SL, fees, P&L, and runtime are engine-controlled.`,
     ].join("\n"), withBack(new InlineKeyboard().text("View Positions", "menu:positions"), "menu:trade"));
   } catch (error) {
-    setTradeFlow(ctx, TRADE_STEPS.ERROR, { strategySlug: slug });
+    setTradeFlow(ctx, TRADE_STEPS.ERROR, { strategySlug: slug, ...(selectedMarketId ? { marketId: selectedMarketId } : {}) });
     const message = error instanceof Error ? error.message : "The trading engine rejected the request.";
-    await renderScreen(ctx, ["⚠️ PAPER BOT NOT STARTED", "", message, "", "No trade was created. Check the requirement and retry when the dependency is available."].join("\n"), new InlineKeyboard().text("Retry", `strategy:start:${slug}`).row().text("Back", "trade:token:SOL"));
+    const retryCallback = selectedMarketId ? `strategy:start:${slug}:${selectedMarketId}:${runtimeMinutes ?? 5}` : `strategy:start:${slug}`;
+    const backCallback = selectedMarketId ? `trade:token:${selectedMarketId}` : "menu:trade";
+    await renderScreen(ctx, ["⚠️ PAPER BOT NOT STARTED", "", message, "", "No trade was created. Check the requirement and retry when the dependency is available."].join("\n"), new InlineKeyboard().text("Retry", retryCallback).row().text("Back", backCallback));
   }
 }
 
@@ -214,3 +230,15 @@ export async function activeStrategiesHandler(ctx: BotContext) {
     `Engine today P&L: ${engineState.todayPnl}`,
   ].join("\n"), withBack(new InlineKeyboard(), "menu:trade"));
 }
+
+function formatTokenLine(token: { name: string; symbol: string; priceUsd: number; priceChange24h: number | null; volume24hUsd: number | null }) {
+  return `${token.name} (${token.symbol}) · $${formatPrice(token.priceUsd)} · ${formatPercent(token.priceChange24h)} · Vol ${formatUsd(token.volume24hUsd)}`;
+}
+
+function formatCandidate(candidate: { market: { name: string; symbol: string; priceUsd: number; priceChange24h: number | null; volume24hUsd: number | null; marketCapUsd: number | null }; score: number; reasons: string[] }) {
+  return [`${candidate.market.name} (${candidate.market.symbol}) · SCORE ${candidate.score}`, `Price $${formatPrice(candidate.market.priceUsd)} · ${formatPercent(candidate.market.priceChange24h)} · Vol ${formatUsd(candidate.market.volume24hUsd)}`, ...candidate.reasons.map((reason) => `- ${reason}`)].join("\n");
+}
+
+function formatPrice(value: number) { return value < 1 ? value.toPrecision(5) : value.toFixed(2); }
+function formatPercent(value: number | null) { return value === null ? "unavailable" : `${value >= 0 ? "+" : ""}${value.toFixed(2)}%`; }
+function formatUsd(value: number | null) { return value === null ? "unavailable" : `$${value.toLocaleString("en-US", { maximumFractionDigits: 0 })}`; }

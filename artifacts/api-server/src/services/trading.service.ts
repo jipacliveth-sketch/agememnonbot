@@ -10,7 +10,13 @@ const ACTIVE_STATUSES: ("STARTING" | "ACTIVE" | "STOPPING")[] = ["STARTING", "AC
 const TRADING_CURRENCY = "USD";
 const TRADING_NETWORK = "BSC" as const;
 
-export async function startPlatformStrategy(db: Database, userId: string, slug: string) {
+export interface StrategyStartOptions {
+  marketId?: string;
+  tokenSymbol?: string;
+  runtimeMinutes?: 5 | 10 | 15;
+}
+
+export async function startPlatformStrategy(db: Database, userId: string, slug: string, options: StrategyStartOptions = {}) {
   const strategy = await db.query.strategies.findFirst({
     where: and(eq(strategies.slug, slug), eq(strategies.status, "AVAILABLE"), eq(strategies.enabled, true)),
   });
@@ -52,6 +58,7 @@ export async function startPlatformStrategy(db: Database, userId: string, slug: 
       userId,
       strategyId: strategy.id,
       allocatedAmount: strategy.minimumBalance,
+      ...options,
     });
     const [active] = await db.update(strategyExecutions).set({
       status: engineExecution.status === "ACTIVE" ? "ACTIVE" : "STARTING",

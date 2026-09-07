@@ -148,10 +148,11 @@ export function createBot(): Bot<BotContext> {
 
   bot.callbackQuery(/^strategy:view:(.+)$/, (ctx) => strategyDetailHandler(ctx, ctx.match![1]));
   bot.callbackQuery(/^strategy:details:(.+)$/, (ctx) => strategyDetailsHandler(ctx, ctx.match![1]));
+  bot.callbackQuery(/^strategy:start:([^:]+):([^:]+):(5|10|15)$/, (ctx) => strategyStartHandler(ctx, ctx.match![1], ctx.match![2], Number(ctx.match![3]) as 5 | 10 | 15));
   bot.callbackQuery(/^strategy:start:(.+)$/, (ctx) => strategyStartHandler(ctx, ctx.match![1]));
   bot.callbackQuery(/^strategy:stop:(.+)$/, (ctx) => strategyStopHandler(ctx, ctx.match![1]));
   bot.callbackQuery(/^trade:network:(SOLANA|BSC)$/, (ctx) => tradeNetworkHandler(ctx, ctx.match![1] as "SOLANA" | "BSC"));
-  bot.callbackQuery("trade:token:SOL", (ctx) => tradeTokenHandler(ctx, "SOL"));
+  bot.callbackQuery(/^trade:token:(.+)$/, (ctx) => tradeTokenHandler(ctx, ctx.match![1]));
   bot.callbackQuery("trade:sniper", sniperEntryHandler);
   bot.callbackQuery("trade:cancel", tradeCancelHandler);
   bot.callbackQuery("strategy:active", activeStrategiesHandler);
@@ -174,18 +175,22 @@ async function tradeTextHandler(ctx: BotContext, next: NextFunction) {
     return;
   }
   const inTrade = ctx.session.flow?.name === "trade";
-  if (text === "trade" || (inTrade && (text === "back" || text === "cancel" || text === "solana" || text === "show tokens" || text === "find something hot" || text === "retry"))) {
+  if (text === "trade" || (inTrade && (text === "back" || text === "cancel" || text === "solana" || text === "show tokens" || text === "sniper" || text === "find something hot" || text === "retry" || text === "stop"))) {
     if (text === "trade") return tradeMenuHandler(ctx);
     if (text === "cancel") return tradeCancelHandler(ctx);
+    if (text === "stop") {
+      const executionId = ctx.session.flow?.data.executionId;
+      return executionId ? strategyStopHandler(ctx, executionId) : activeStrategiesHandler(ctx);
+    }
     if (text === "back") {
       const step = ctx.session.flow?.step;
       if (step === "VIEWING_TOKEN") {
         return tradeNetworkHandler(ctx, (ctx.session.flow?.data.network as "SOLANA" | "BSC") ?? "SOLANA");
       }
-      if (step === "ERROR" && ctx.session.flow?.data.strategySlug) return tradeTokenHandler(ctx, "SOL");
+      if (step === "ERROR" && ctx.session.flow?.data.strategySlug && ctx.session.flow.data.marketId) return tradeTokenHandler(ctx, ctx.session.flow.data.marketId);
       return tradeMenuHandler(ctx);
     }
-    if (text === "find something hot") return sniperEntryHandler(ctx);
+    if (text === "sniper" || text === "find something hot") return sniperEntryHandler(ctx);
     if (text === "retry" && ctx.session.flow?.step === "ERROR") {
       const failedStrategy = ctx.session.flow.data.strategySlug;
       if (failedStrategy) return strategyStartHandler(ctx, failedStrategy);

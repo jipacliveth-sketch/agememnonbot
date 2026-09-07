@@ -12,12 +12,20 @@ export interface AccountTradingState {
   userId: string;
   activePositionsCount: number;
   todayPnl: string;
+  paperBalance?: string;
 }
 
 export interface StartStrategyRequest {
   userId: string;
   strategyId: string;
   allocatedAmount: string;
+  marketId?: string;
+  tokenSymbol?: string;
+  runtimeMinutes?: 5 | 10 | 15;
+  takeProfit?: number;
+  stopLoss?: number;
+  feeRate?: number;
+  slippageBps?: number;
 }
 
 export interface StrategyExecution {
@@ -33,6 +41,12 @@ export interface Position {
   amount: string;
   status: "OPEN" | "CLOSED";
   realizedPnl: string | null;
+  currentPrice?: string;
+  unrealizedPnl?: string;
+  takeProfit?: string;
+  stopLoss?: string;
+  expiresAt?: Date;
+  marketId?: string;
 }
 
 export interface Trade {
@@ -41,6 +55,8 @@ export interface Trade {
   amount: string;
   price: string;
   executedAt: Date;
+  fee?: string;
+  slippage?: string;
 }
 
 export interface PnL {

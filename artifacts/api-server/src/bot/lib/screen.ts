@@ -33,7 +33,7 @@ export async function renderMediaScreen(
   keyboard: InlineKeyboard | undefined,
   assetName = "agamemnon-helmet.png",
 ) {
-  const media = new InputFile(resolve(process.cwd(), "assets/telegram", assetName));
+  const media = assetName.startsWith("http") ? assetName : new InputFile(resolve(process.cwd(), "assets/telegram", assetName));
   if (ctx.callbackQuery) {
     try {
       await ctx.editMessageMedia({ type: "photo", media, caption: text }, { reply_markup: keyboard });
