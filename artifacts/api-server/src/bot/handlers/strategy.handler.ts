@@ -41,7 +41,7 @@ export async function tradeMenuHandler(ctx: BotContext) {
   await renderMediaScreen(ctx, [
     "🚀 TRADE",
     "",
-    "Paper execution only. Choose a supported network to inspect executable strategies and live market data.",
+    "Disclosure: this workflow uses simulated paper execution with live market data.",
   ].join("\n"), tradeKeyboard());
 }
 
