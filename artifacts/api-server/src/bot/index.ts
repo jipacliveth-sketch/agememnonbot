@@ -23,6 +23,10 @@ import {
   strategyStartHandler,
   strategyStopHandler,
   activeStrategiesHandler,
+  tradeNetworkHandler,
+  tradeTokenHandler,
+  sniperEntryHandler,
+  tradeCancelHandler,
 } from "./handlers/strategy.handler";
 import { positionsHandler } from "./handlers/positions.handler";
 import { learnMoreHandler, settingsHandler, supportedNetworksHandler, toggleNotificationsHandler } from "./handlers/settings.handler";
@@ -31,6 +35,7 @@ import { Network } from "../blockchain/provider.interface";
 import { RedisStorage } from "./redis-storage";
 import { RateLimiter } from "./rate-limit";
 import { withRetry } from "../lib/retry";
+import { NextFunction } from "grammy";
 
 export function createBot(): Bot<BotContext> {
   const bot = new Bot<BotContext>(env.TELEGRAM_BOT_TOKEN);
@@ -101,6 +106,7 @@ export function createBot(): Bot<BotContext> {
 
   // Intercepts plain text messages ONLY while the user is mid-deposit-flow
   // (pasting a tx hash); calls next() otherwise so commands still work.
+  bot.on("message:text", tradeTextHandler);
   bot.on("message:text", withdrawalTextHandler);
   bot.on("message:text", depositTxHashSubmissionHandler);
 
@@ -144,6 +150,10 @@ export function createBot(): Bot<BotContext> {
   bot.callbackQuery(/^strategy:details:(.+)$/, (ctx) => strategyDetailsHandler(ctx, ctx.match![1]));
   bot.callbackQuery(/^strategy:start:(.+)$/, (ctx) => strategyStartHandler(ctx, ctx.match![1]));
   bot.callbackQuery(/^strategy:stop:(.+)$/, (ctx) => strategyStopHandler(ctx, ctx.match![1]));
+  bot.callbackQuery(/^trade:network:(SOLANA|BSC)$/, (ctx) => tradeNetworkHandler(ctx, ctx.match![1] as "SOLANA" | "BSC"));
+  bot.callbackQuery("trade:token:SOL", (ctx) => tradeTokenHandler(ctx, "SOL"));
+  bot.callbackQuery("trade:sniper", sniperEntryHandler);
+  bot.callbackQuery("trade:cancel", tradeCancelHandler);
   bot.callbackQuery("strategy:active", activeStrategiesHandler);
   bot.callbackQuery(/^history:page:(\d+)$/, (ctx) => transactionHistoryHandler(ctx, Number(ctx.match![1])));
   bot.callbackQuery(/^withdrawals:page:(\d+)$/, (ctx) => withdrawalHistoryHandler(ctx, Number(ctx.match![1])));
@@ -155,6 +165,35 @@ export function createBot(): Bot<BotContext> {
   });
 
   return bot;
+}
+
+async function tradeTextHandler(ctx: BotContext, next: NextFunction) {
+  const text = ctx.message?.text?.trim().toLowerCase();
+  if (!text || text.startsWith("/")) {
+    await next();
+    return;
+  }
+  const inTrade = ctx.session.flow?.name === "trade";
+  if (text === "trade" || (inTrade && (text === "back" || text === "cancel" || text === "solana" || text === "show tokens" || text === "find something hot" || text === "retry"))) {
+    if (text === "trade") return tradeMenuHandler(ctx);
+    if (text === "cancel") return tradeCancelHandler(ctx);
+    if (text === "back") {
+      const step = ctx.session.flow?.step;
+      if (step === "VIEWING_TOKEN") {
+        return tradeNetworkHandler(ctx, (ctx.session.flow?.data.network as "SOLANA" | "BSC") ?? "SOLANA");
+      }
+      if (step === "ERROR" && ctx.session.flow?.data.strategySlug) return tradeTokenHandler(ctx, "SOL");
+      return tradeMenuHandler(ctx);
+    }
+    if (text === "find something hot") return sniperEntryHandler(ctx);
+    if (text === "retry" && ctx.session.flow?.step === "ERROR") {
+      const failedStrategy = ctx.session.flow.data.strategySlug;
+      if (failedStrategy) return strategyStartHandler(ctx, failedStrategy);
+      return sniperEntryHandler(ctx);
+    }
+    return tradeNetworkHandler(ctx, "SOLANA");
+  }
+  await next();
 }
 
 function isTransientTelegramError(error: unknown) {

@@ -7,7 +7,7 @@ export interface SessionData {
   // picked. Actual amounts/addresses are re-validated server-side before
   // any balance-affecting action.
   flow?: {
-    name: "deposit" | "withdrawal" | "strategy_start";
+    name: "deposit" | "withdrawal" | "strategy_start" | "trade";
     step: string;
     data: Record<string, string>;
   };

@@ -1,4 +1,6 @@
 import { InlineKeyboard } from "grammy";
+import { InputFile } from "grammy";
+import { resolve } from "node:path";
 import { BotContext } from "../context";
 
 /**
@@ -9,6 +11,11 @@ import { BotContext } from "../context";
  */
 export async function renderScreen(ctx: BotContext, text: string, keyboard?: InlineKeyboard) {
   if (ctx.callbackQuery) {
+    if (ctx.session.flow?.name === "trade" && ctx.chat && ctx.callbackQuery.message && "photo" in ctx.callbackQuery.message) {
+      await ctx.api.deleteMessage(ctx.chat.id, ctx.callbackQuery.message.message_id).catch(() => undefined);
+      await ctx.reply(text, { reply_markup: keyboard });
+      return;
+    }
     try {
       await ctx.editMessageText(text, { reply_markup: keyboard });
       return;
@@ -18,6 +25,24 @@ export async function renderScreen(ctx: BotContext, text: string, keyboard?: Inl
     }
   }
   await ctx.reply(text, { reply_markup: keyboard });
+}
+
+export async function renderMediaScreen(
+  ctx: BotContext,
+  text: string,
+  keyboard: InlineKeyboard | undefined,
+  assetName = "agamemnon-helmet.png",
+) {
+  const media = new InputFile(resolve(process.cwd(), "assets/telegram", assetName));
+  if (ctx.callbackQuery) {
+    try {
+      await ctx.editMessageMedia({ type: "photo", media, caption: text }, { reply_markup: keyboard });
+      return;
+    } catch {
+      // Fall through when the current message is not media or Telegram cannot edit it.
+    }
+  }
+  await ctx.replyWithPhoto(media, { caption: text, reply_markup: keyboard });
 }
 
 /**
