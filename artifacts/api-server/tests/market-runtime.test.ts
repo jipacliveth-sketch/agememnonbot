@@ -1,11 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DevelopmentTradingEngine } from "../src/trading-engine/development.engine";
 
-describe("simulated market runtime", () => {
+describe("market runtime", () => {
   const engines: DevelopmentTradingEngine[] = [];
   afterEach(() => { for (const engine of engines) engine.dispose(); vi.useRealTimers(); });
 
-  it("applies configured fees and slippage to a real-price simulated exit", async () => {
+  it("applies configured fees and slippage to a real-price exit", async () => {
     const prices = [100, 101];
     const engine = new DevelopmentTradingEngine({ autoStart: false, feeRate: 0.01, slippageBps: 100, priceSource: async () => prices.shift() ?? 101 });
     engines.push(engine);

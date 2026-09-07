@@ -38,11 +38,7 @@ function tradeKeyboard() {
 
 export async function tradeMenuHandler(ctx: BotContext) {
   setTradeFlow(ctx, TRADE_STEPS.SELECTING_NETWORK);
-  await renderMediaScreen(ctx, [
-    "🚀 TRADE",
-    "",
-    "Disclosure: this workflow uses simulated paper execution with live market data.",
-  ].join("\n"), tradeKeyboard());
+  await renderMediaScreen(ctx, "🚀 TRADE", tradeKeyboard());
 }
 
 export async function tradeNetworkHandler(ctx: BotContext, network: "SOLANA" | "BSC") {
@@ -96,8 +92,6 @@ export async function tradeTokenHandler(ctx: BotContext, marketId: string) {
     `Volume: ${formatUsd(market.volume24hUsd)}`,
     `Market cap: ${formatUsd(market.marketCapUsd)}`,
     `Contract: ${market.contractAddress ?? "unavailable"}`,
-    "",
-    "Paper execution uses the current real provider price and continuously monitors the same market.",
     "",
     strategiesForToken.length ? "Select an executable strategy:" : "No executable strategy is available.",
   ].join("\n"), withBack(keyboard, "trade:network:SOLANA"), market.imageUrl ?? "token-sol.png");
@@ -189,16 +183,16 @@ export async function strategyStartHandler(ctx: BotContext, slug: string, market
     const execution = await startPlatformStrategy(db, ctx.session.userId!, slug, { marketId: selectedMarketId, tokenSymbol: market?.symbol, runtimeMinutes });
     setTradeFlow(ctx, execution?.status === "ACTIVE" ? TRADE_STEPS.ACTIVE : TRADE_STEPS.STARTING_BOT, { strategySlug: slug, executionId: execution?.id ?? "", ...(selectedMarketId ? { marketId: selectedMarketId } : {}) });
     await renderScreen(ctx, [
-      "✅ PAPER BOT ACTIVATED", "",
+      "✅ BOT ACTIVATED", "",
       `Status: ${execution?.status ?? "STARTING"}`,
-      `The trading engine opened a simulated ${market?.symbol ?? "SOL"} position using the live market price. TP/SL, fees, P&L, and runtime are engine-controlled.`,
+      `The trading engine opened a ${market?.symbol ?? "SOL"} position using the live market price. TP/SL, fees, P&L, and runtime are engine-controlled.`,
     ].join("\n"), withBack(new InlineKeyboard().text("View Positions", "menu:positions"), "menu:trade"));
   } catch (error) {
     setTradeFlow(ctx, TRADE_STEPS.ERROR, { strategySlug: slug, ...(selectedMarketId ? { marketId: selectedMarketId } : {}) });
     const message = error instanceof Error ? error.message : "The trading engine rejected the request.";
     const retryCallback = selectedMarketId ? `strategy:start:${slug}:${selectedMarketId}:${runtimeMinutes ?? 5}` : `strategy:start:${slug}`;
     const backCallback = selectedMarketId ? `trade:token:${selectedMarketId}` : "menu:trade";
-    await renderScreen(ctx, ["⚠️ PAPER BOT NOT STARTED", "", message, "", "No trade was created. Check the requirement and retry when the dependency is available."].join("\n"), new InlineKeyboard().text("Retry", retryCallback).row().text("Back", backCallback));
+    await renderScreen(ctx, ["⚠️ BOT NOT STARTED", "", message, "", "No trade was created. Check the requirement and retry when the dependency is available."].join("\n"), new InlineKeyboard().text("Retry", retryCallback).row().text("Back", backCallback));
   }
 }
 

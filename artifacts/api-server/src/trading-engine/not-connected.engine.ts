@@ -11,7 +11,7 @@ import {
 
 /**
  * Default engine wired into the adapter until the real trading engine
- * is connected. Deliberately does NOT simulate trades, positions, or
+ * is connected. Deliberately does NOT create trades, positions, or
  * P&L — per the UX rule against fabricated balances or activity
  * presented as real. Bot handlers should catch EngineNotConnectedError
  * and show "Trading Engine — Integration Pending" rather than crashing

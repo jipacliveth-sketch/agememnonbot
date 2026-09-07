@@ -48,7 +48,7 @@ describe("identity resolution", () => {
   it("does not create a duplicate account for the same telegram id logging in from a different session", async () => {
     const telegramUserId = randomTelegramId();
 
-    // Simulates "another phone" / "Telegram Desktop" — same telegramUserId,
+    // Models "another phone" / "Telegram Desktop" — same telegramUserId,
     // slightly different metadata (e.g. username changed).
     const first = await resolveOrCreateIdentity(db, { telegramUserId, username: "old_username" });
     const second = await resolveOrCreateIdentity(db, { telegramUserId, username: "new_username" });

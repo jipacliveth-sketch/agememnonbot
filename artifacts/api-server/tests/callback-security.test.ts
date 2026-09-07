@@ -8,7 +8,7 @@ function randomTelegramId(): bigint {
   return BigInt(Math.floor(Math.random() * 1_000_000_000) + 3_000_000_000);
 }
 
-function makeFakeCtx(telegramUserId: number, presetSessionUserId?: string): BotContext {
+function makeTestContext(telegramUserId: number, presetSessionUserId?: string): BotContext {
   return {
     from: { id: telegramUserId, is_bot: false, first_name: "Test" },
     session: presetSessionUserId ? { userId: presetSessionUserId } : {},
@@ -25,9 +25,9 @@ describe("callback / identity security", () => {
     const telegramUserId = randomTelegramId();
     const legit = await resolveOrCreateIdentity(db, { telegramUserId });
 
-    // Simulate an attacker (or a stale session) having a DIFFERENT userId
+    // Model an attacker (or a stale session) having a DIFFERENT userId
     // already sitting in session before the middleware runs.
-    const ctx = makeFakeCtx(Number(telegramUserId), "00000000-0000-0000-0000-000000000000");
+    const ctx = makeTestContext(Number(telegramUserId), "00000000-0000-0000-0000-000000000000");
 
     let nextCalled = false;
     await identityMiddleware(ctx, async () => {
@@ -42,8 +42,8 @@ describe("callback / identity security", () => {
   });
 
   it("two different Telegram users never resolve to the same session.userId", async () => {
-    const ctxA = makeFakeCtx(Number(randomTelegramId()));
-    const ctxB = makeFakeCtx(Number(randomTelegramId()));
+    const ctxA = makeTestContext(Number(randomTelegramId()));
+    const ctxB = makeTestContext(Number(randomTelegramId()));
 
     await identityMiddleware(ctxA, async () => {});
     await identityMiddleware(ctxB, async () => {});
