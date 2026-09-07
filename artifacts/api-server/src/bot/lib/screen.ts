@@ -12,9 +12,12 @@ import { BotContext } from "../context";
 export async function renderScreen(ctx: BotContext, text: string, keyboard?: InlineKeyboard) {
   if (ctx.callbackQuery) {
     if (ctx.session.flow?.name === "trade" && ctx.chat && ctx.callbackQuery.message && "photo" in ctx.callbackQuery.message) {
-      await ctx.api.deleteMessage(ctx.chat.id, ctx.callbackQuery.message.message_id).catch(() => undefined);
-      await ctx.reply(text, { reply_markup: keyboard });
-      return;
+      try {
+        await ctx.editMessageCaption({ caption: text, reply_markup: keyboard });
+        return;
+      } catch {
+        // Fall through when Telegram cannot edit a caption (for example, an old message).
+      }
     }
     try {
       await ctx.editMessageText(text, { reply_markup: keyboard });

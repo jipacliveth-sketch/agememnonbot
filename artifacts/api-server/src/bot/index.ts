@@ -36,6 +36,7 @@ import { Network } from "../blockchain/provider.interface";
 import { RedisStorage } from "./redis-storage";
 import { RateLimiter } from "./rate-limit";
 import { withRetry } from "../lib/retry";
+import { log } from "../lib/logger";
 import { NextFunction } from "grammy";
 
 export function createBot(): Bot<BotContext> {
@@ -49,6 +50,15 @@ export function createBot(): Bot<BotContext> {
       shouldRetry: isTransientTelegramError,
     }),
   );
+
+  bot.use(async (ctx, next) => {
+    if (ctx.callbackQuery) {
+      const startedAt = Date.now();
+      try { await ctx.answerCallbackQuery(); } catch { }
+      log("info", "telegram_callback_ack", { durationMs: Date.now() - startedAt });
+    }
+    await next();
+  });
 
   bot.use(
     session<SessionData, BotContext>({
@@ -75,8 +85,7 @@ export function createBot(): Bot<BotContext> {
   bot.use(async (ctx, next) => {
     const key = `${ctx.from?.id ?? "anonymous"}:${ctx.callbackQuery ? "callback" : "message"}`;
     if (!limiter.allow(key)) {
-      if (ctx.callbackQuery) await ctx.answerCallbackQuery({ text: "Too many requests. Try again shortly." });
-      else await ctx.reply("Too many requests. Please try again shortly.");
+      if (!ctx.callbackQuery) await ctx.reply("Too many requests. Please try again shortly.");
       return;
     }
     await next();
@@ -91,17 +100,6 @@ export function createBot(): Bot<BotContext> {
     } catch (err) {
       await renderError(ctx, err);
     }
-  });
-
-  // Registered before specific callback routes so it wraps them (calls
-  // next() to run the matched handler after acknowledging the callback.
-  bot.on("callback_query:data", async (ctx, next) => {
-    try {
-      await ctx.answerCallbackQuery();
-    } catch {
-      /* Telegram may have already acknowledged this callback. */
-    }
-    await next();
   });
 
   // Intercepts plain text messages ONLY while the user is mid-deposit-flow

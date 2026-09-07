@@ -2,6 +2,7 @@ import { withRetry } from "../lib/retry";
 
 const COINGECKO_BASE_URL = "https://api.coingecko.com/api/v3";
 const CACHE_TTL_MS = 30_000;
+const REQUEST_TIMEOUT_MS = 8_000;
 const COINGECKO_IDS: Record<string, string> = { SOL: "solana", USDT: "tether", BNB: "binancecoin", BTC: "bitcoin", ETH: "ethereum" };
 
 export type MarketNetwork = "SOLANA" | "BSC" | "ETHEREUM" | "BASE" | "UNKNOWN";
@@ -55,6 +56,8 @@ interface CoinGeckoMarketRow {
 class CoinGeckoMarketDataProvider implements MarketDataProvider {
   private readonly marketCache = new Map<string, { value: MarketData; expiresAt: number }>();
   private readonly discoveryCache = new Map<string, { value: MarketData[]; expiresAt: number }>();
+  private readonly marketRequests = new Map<string, Promise<MarketData>>();
+  private readonly discoveryRequests = new Map<string, Promise<MarketData[]>>();
 
   async discoverMarkets(options: { network: MarketNetwork; category?: string; limit?: number }): Promise<MarketData[]> {
     if (options.network !== "SOLANA") return [];
@@ -63,22 +66,42 @@ class CoinGeckoMarketDataProvider implements MarketDataProvider {
     const cacheKey = `${category}:${limit}`;
     const cached = this.discoveryCache.get(cacheKey);
     if (cached && cached.expiresAt > Date.now()) return cached.value.map(copyMarket);
-    const params = new URLSearchParams({ vs_currency: "usd", category, order: "volume_desc", per_page: String(limit), page: "1", sparkline: "false" });
-    const rows = await this.request<CoinGeckoMarketRow[]>(`/coins/markets?${params}`);
-    const markets = rows.map((row) => normalizeMarket(row, "SOLANA")).filter(Boolean) as MarketData[];
-    this.discoveryCache.set(cacheKey, { value: markets, expiresAt: Date.now() + CACHE_TTL_MS });
-    for (const market of markets) this.marketCache.set(market.id, { value: market, expiresAt: Date.now() + CACHE_TTL_MS });
-    return markets.map(copyMarket);
+    const pending = this.discoveryRequests.get(cacheKey) ?? this.fetchDiscovery(category, limit);
+    this.discoveryRequests.set(cacheKey, pending);
+    try {
+      return (await pending).map(copyMarket);
+    } finally {
+      if (this.discoveryRequests.get(cacheKey) === pending) this.discoveryRequests.delete(cacheKey);
+    }
   }
 
   async getMarket(id: string): Promise<MarketData> {
     const cached = this.marketCache.get(id);
     if (cached && cached.expiresAt > Date.now()) return copyMarket(cached.value);
+    const pending = this.marketRequests.get(id) ?? this.fetchMarket(id);
+    this.marketRequests.set(id, pending);
+    try {
+      return copyMarket(await pending);
+    } finally {
+      if (this.marketRequests.get(id) === pending) this.marketRequests.delete(id);
+    }
+  }
+
+  private async fetchDiscovery(category: string, limit: number) {
+    const params = new URLSearchParams({ vs_currency: "usd", category, order: "volume_desc", per_page: String(limit), page: "1", sparkline: "false" });
+    const rows = await this.request<CoinGeckoMarketRow[]>(`/coins/markets?${params}`);
+    const markets = rows.map((row) => normalizeMarket(row, "SOLANA")).filter(Boolean) as MarketData[];
+    this.discoveryCache.set(`${category}:${limit}`, { value: markets, expiresAt: Date.now() + CACHE_TTL_MS });
+    for (const market of markets) this.marketCache.set(market.id, { value: market, expiresAt: Date.now() + CACHE_TTL_MS });
+    return markets;
+  }
+
+  private async fetchMarket(id: string) {
     const row = await this.request<CoinGeckoMarketRow>(`/coins/${encodeURIComponent(id)}?localization=false&tickers=false&market_data=true&community_data=false&developer_data=false&sparkline=false`);
     const market = normalizeMarket(row, inferNetwork(row));
     if (!market) throw new Error(`CoinGecko returned incomplete market data for ${id}.`);
     this.marketCache.set(id, { value: market, expiresAt: Date.now() + CACHE_TTL_MS });
-    return copyMarket(market);
+    return market;
   }
 
   async getPrice(id: string): Promise<PriceQuote> {
@@ -88,7 +111,7 @@ class CoinGeckoMarketDataProvider implements MarketDataProvider {
 
   private async request<T>(path: string): Promise<T> {
     return withRetry(async () => {
-      const response = await fetch(`${COINGECKO_BASE_URL}${path}`, { headers: { accept: "application/json" } });
+      const response = await fetch(`${COINGECKO_BASE_URL}${path}`, { headers: { accept: "application/json" }, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
       if (!response.ok) throw new Error(`CoinGecko request failed: HTTP ${response.status}`);
       return (await response.json()) as T;
     }, { operation: "coingecko_market_data", maxAttempts: 3, initialDelayMs: 300, maxDelayMs: 3_000 });

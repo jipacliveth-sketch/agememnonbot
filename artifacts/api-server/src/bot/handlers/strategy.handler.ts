@@ -13,6 +13,24 @@ import { scanSolanaMarkets } from "../../services/market-scanner.service";
 import { getWalletBalances } from "../../services/ledger.service";
 import { chooseMemeToken, SIMULATION_CONFIG, SNIPER_MEME_TOKENS, TRADE_MEME_TOKENS } from "../../config/simulation";
 import { calculatePositionSize, calculateTradeResult, capPositivePnl, completeSimulation, createSimulation, formatCooldown, getActiveSimulation, recordSimulationTrade, stopSimulation } from "../../services/simulation.service";
+import { log, logError } from "../../lib/logger";
+
+const activeWorkflows = new Map<string, Promise<void>>();
+
+function startWorkflow(userId: string, operation: string, task: () => Promise<void>) {
+  if (activeWorkflows.has(userId)) return false;
+  const startedAt = Date.now();
+  const work = task().catch((error) => logError("trade_workflow_failed", error, { userId, operation })).finally(() => {
+    log("info", "trade_workflow_complete", { userId, operation, durationMs: Date.now() - startedAt });
+    if (activeWorkflows.get(userId) === work) activeWorkflows.delete(userId);
+  });
+  activeWorkflows.set(userId, work);
+  return true;
+}
+
+function logDuration(operation: string, startedAt: number, fields: Record<string, unknown> = {}) {
+  log("info", "trade_latency", { operation, durationMs: Date.now() - startedAt, ...fields });
+}
 
 const TRADE_STEPS = {
   MENU: "MENU",
@@ -39,21 +57,33 @@ function tradeKeyboard() {
 }
 
 export async function tradeMenuHandler(ctx: BotContext) {
-  const active = await getActiveSimulation(db, ctx.session.userId!, "TRADE");
-  if (active) {
-    setTradeFlow(ctx, TRADE_STEPS.RUNNING, { sessionId: active.id });
-    await renderMediaScreen(ctx, formatSimulation(active), new InlineKeyboard().text("STOP BOT", "trade:cancel").row().text("BACK", "menu:main"));
-    return;
-  }
   setTradeFlow(ctx, TRADE_STEPS.MENU);
+  const startedAt = Date.now();
   await renderMediaScreen(ctx, "⚡ TRADE BOT", tradeKeyboard());
+  logDuration("trade_button_initial", startedAt);
+  const userId = ctx.session.userId!;
+  void (async () => {
+    const startedAt = Date.now();
+    try {
+      const active = await getActiveSimulation(db, userId, "TRADE");
+      logDuration("trade_menu_status", startedAt, { active: Boolean(active) });
+      if (active && ctx.session.flow?.step === TRADE_STEPS.MENU) {
+        setTradeFlow(ctx, TRADE_STEPS.RUNNING, { sessionId: active.id });
+        await renderMediaScreen(ctx, formatSimulation(active), new InlineKeyboard().text("STOP BOT", "trade:cancel").row().text("BACK", "menu:main"));
+      }
+    } catch (error) {
+      logError("trade_menu_status_failed", error, { userId });
+    }
+  });
 }
 
 export async function tradeStartHandler(ctx: BotContext) {
   if (ctx.session.flow?.step === TRADE_STEPS.STARTING || ctx.session.flow?.step === TRADE_STEPS.RUNNING) return;
   setTradeFlow(ctx, TRADE_STEPS.STARTING);
+  const startedAt = Date.now();
   await renderMediaScreen(ctx, "🤖 BOT STARTING...", new InlineKeyboard().text("STOP BOT", "trade:cancel"));
-  void runSimulation(ctx, "TRADE");
+  logDuration("start_bot_initial", startedAt);
+  startWorkflow(ctx.session.userId!, "trade_simulation", () => runSimulation(ctx, "TRADE", startedAt));
 }
 
 export async function tradeNetworkHandler(ctx: BotContext, network: "SOLANA" | "BSC") {
@@ -63,21 +93,34 @@ export async function tradeNetworkHandler(ctx: BotContext, network: "SOLANA" | "
     await renderScreen(ctx, "BEP20 BNB\n\nNo executable BSC token strategy is configured in the trading engine yet.", withBack(keyboard, "menu:trade"));
     return;
   }
-  try {
+  const startedAt = Date.now();
+  await renderScreen(ctx, "SOLANA\n\nSCANNING LIVE MARKETS...", withBack(keyboard, "menu:trade"));
+  logDuration("token_selection_initial", startedAt);
+  startWorkflow(ctx.session.userId!, "token_discovery", async () => {
+   const startedAt = Date.now();
+   try {
     const tokens = await discoverSolanaTokens("all", 10);
+    logDuration("token_discovery", startedAt, { count: tokens.length });
     for (const token of tokens) keyboard.text(`${token.name} (${token.symbol})`, `trade:token:${token.id}`).row();
     const text = tokens.length
       ? ["SOLANA · LIVE TOKEN DISCOVERY", "", ...tokens.map(formatTokenLine), "", "Select a real market to view details."] .join("\n")
       : "SOLANA\n\nNo live Solana markets qualified for display right now.";
     await renderScreen(ctx, text, withBack(keyboard, "menu:trade"));
   } catch (error) {
+    logDuration("token_discovery", startedAt, { failed: true });
     const message = error instanceof Error ? error.message : "The Solana market provider is unavailable.";
     await renderScreen(ctx, ["SOLANA MARKET DISCOVERY FAILED", "", message, "", "No token data was fabricated."].join("\n"), new InlineKeyboard().text("Retry", "trade:network:SOLANA").row().text("Back", "menu:trade"));
   }
+  });
 }
 
 export async function tradeTokenHandler(ctx: BotContext, marketId: string) {
   setTradeFlow(ctx, TRADE_STEPS.VIEWING_TOKEN, { network: "SOLANA", marketId });
+  const startedAt = Date.now();
+  await renderScreen(ctx, "TOKEN\n\nLOADING MARKET DETAILS...", withBack(new InlineKeyboard(), "trade:network:SOLANA"));
+  logDuration("token_details_initial", startedAt, { marketId });
+  startWorkflow(ctx.session.userId!, "token_details", async () => {
+   const startedAt = Date.now();
   let strategiesForToken;
   let market;
   try {
@@ -87,7 +130,9 @@ export async function tradeTokenHandler(ctx: BotContext, marketId: string) {
       }),
       getMarket(marketId),
     ]);
+    logDuration("token_details", startedAt, { marketId });
   } catch (error) {
+    logDuration("token_details", startedAt, { marketId, failed: true });
     const message = error instanceof Error ? error.message : "The market provider is unavailable.";
     await renderScreen(ctx, ["TOKEN DATA UNAVAILABLE", "", message, "", "No price or token details were fabricated."].join("\n"), new InlineKeyboard().text("Retry", `trade:token:${marketId}`).row().text("Back", "trade:network:SOLANA"));
     return;
@@ -110,22 +155,29 @@ export async function tradeTokenHandler(ctx: BotContext, marketId: string) {
     "",
     strategiesForToken.length ? "Select an executable strategy:" : "No executable strategy is available.",
   ].join("\n"), withBack(keyboard, "trade:network:SOLANA"), market.imageUrl ?? "token-sol.png");
+  });
 }
 
 export async function sniperEntryHandler(ctx: BotContext) {
   if (ctx.session.flow?.step === TRADE_STEPS.SCANNING_SNIPER || ctx.session.flow?.step === TRADE_STEPS.SNIPER_RUNNING) return;
   setTradeFlow(ctx, TRADE_STEPS.SCANNING_SNIPER);
+  const startedAt = Date.now();
   await renderMediaScreen(ctx, "🔎 ANALYZING MARKET", new InlineKeyboard().text("BACK", "menu:trade"));
-  void runSimulation(ctx, "SNIPER");
+  logDuration("sniper_entry_initial", startedAt);
+  startWorkflow(ctx.session.userId!, "sniper_simulation", () => runSimulation(ctx, "SNIPER", startedAt));
 }
 
-async function runSimulation(ctx: BotContext, type: "TRADE" | "SNIPER") {
+async function runSimulation(ctx: BotContext, type: "TRADE" | "SNIPER", interactionStartedAt: number) {
   try {
     const universe = type === "TRADE" ? TRADE_MEME_TOKENS : SNIPER_MEME_TOKENS;
     const token = chooseMemeToken(universe);
-    const market = await getMarket(token.marketId);
+    const startedAt = Date.now();
+    const [market, wallet] = await Promise.all([
+      getMarket(token.marketId),
+      db.query.wallets.findFirst({ where: eq(wallets.userId, ctx.session.userId!) }),
+    ]);
+    logDuration("simulation_prerequisites", startedAt, { type, marketId: token.marketId });
     if (market.symbol !== token.symbol) throw new Error(`Configured ${token.symbol} market resolved as ${market.symbol}.`);
-    const wallet = await db.query.wallets.findFirst({ where: eq(wallets.userId, ctx.session.userId!) });
     const balance = Number(wallet?.availableBalance ?? 0);
     const positionSize = type === "SNIPER" ? calculatePositionSize(balance).amount : balance * 0.2;
     const created = await createSimulation(db, ctx.session.userId!, type, { ...market, marketId: market.id }, type === "SNIPER" ? SIMULATION_CONFIG.sniperRuntimeMs : SIMULATION_CONFIG.tradeRuntimeMs, positionSize);
@@ -134,7 +186,7 @@ async function runSimulation(ctx: BotContext, type: "TRADE" | "SNIPER") {
     if (type === "SNIPER") await renderMediaScreen(ctx, `⚡ SNIPER TARGET FOUND\n\nToken: $${session.tokenSymbol}\nEntry: $${formatPrice(Number(session.entryPrice))}`, new InlineKeyboard().text("STOP BOT", "trade:cancel"));
     else await renderMediaScreen(ctx, `🟢 BOT RUNNING\n\nTOKEN SELECTED\n${session.tokenSymbol}\n\nEntry: $${formatPrice(Number(session.entryPrice))}`, new InlineKeyboard().text("STOP BOT", "trade:cancel"));
     setTradeFlow(ctx, type === "SNIPER" ? TRADE_STEPS.SNIPER_RUNNING : TRADE_STEPS.RUNNING, { sessionId: session.id });
-    await monitorSimulation(ctx, session.id, type);
+    await monitorSimulation(ctx, session.id, type, interactionStartedAt);
   } catch (error) {
     const cooldown = formatCooldown(error);
     setTradeFlow(ctx, TRADE_STEPS.ERROR, {});
@@ -142,7 +194,7 @@ async function runSimulation(ctx: BotContext, type: "TRADE" | "SNIPER") {
   }
 }
 
-async function monitorSimulation(ctx: BotContext, sessionId: string, type: "TRADE" | "SNIPER") {
+async function monitorSimulation(ctx: BotContext, sessionId: string, type: "TRADE" | "SNIPER", interactionStartedAt: number) {
   const deadline = Date.now() + (type === "SNIPER" ? SIMULATION_CONFIG.sniperRuntimeMs : SIMULATION_CONFIG.tradeRuntimeMs);
   let completedTrades = 0;
   while (Date.now() < deadline && completedTrades < (type === "SNIPER" ? 1 : 10)) {
@@ -163,6 +215,7 @@ async function monitorSimulation(ctx: BotContext, sessionId: string, type: "TRAD
   if (completed) {
     setTradeFlow(ctx, TRADE_STEPS.COMPLETE, { sessionId });
     await renderMediaScreen(ctx, formatCompletion(completed), new InlineKeyboard().text("TRADE AGAIN", "trade:start").text("SNIPER ENTRY", "trade:sniper"));
+    logDuration("final_result", interactionStartedAt, { sessionId, type });
   }
 }
 

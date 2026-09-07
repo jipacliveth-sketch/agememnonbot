@@ -24,7 +24,6 @@ export async function startHandler(ctx: BotContext) {
       "monitor your positions and manage your trading wallet",
       "directly from Telegram.",
       "",
-      "Trade and Sniper Entry are simulated trading experiences using market-inspired scenarios. No real trades are executed.",
     ].join("\n");
 
     const keyboard = new InlineKeyboard().text("🚀 Get Started", "menu:main").text("ℹ️ Learn More", "menu:learn_more");
